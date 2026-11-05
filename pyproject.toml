@@ -1,0 +1,42 @@
+[project]
+name = "metatomic-qtip4pf"
+dynamic = ["version"]
+description = "q-TIP4P/F flexible water model as a metatomic model, in pure PyTorch"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Michele Ceriotti", email = "michele.ceriotti@epfl.ch" }]
+requires-python = ">=3.10"
+dependencies = [
+    "torch >=2.3",
+    "metatomic-torch >=0.1.19,<0.2",
+]
+keywords = ["water", "force field", "q-TIP4P/F", "metatomic", "molecular dynamics"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "vesin >=0.4"]
+
+[project.scripts]
+metatomic-qtip4pf = "metatomic_qtip4pf._cli:main"
+
+[project.urls]
+repository = "https://github.com/metatensor/qtip4pf"
+
+[build-system]
+requires = ["setuptools >=77", "setuptools-scm >=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_file = "src/metatomic_qtip4pf/_version.py"
+fallback_version = "0.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:`torch.jit.*:DeprecationWarning"]
