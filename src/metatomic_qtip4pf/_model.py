@@ -10,7 +10,7 @@ parameters below are exactly those of Table I in the paper.
 """
 
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
@@ -34,11 +34,6 @@ PARAMETERS: Dict[str, float] = {
 # the thermochemical calorie (4.184 J) and eps_0 = 8.8541878128e-12 F/m (CODATA
 # 2018). CODATA 2022 changes this by ~5e-10 relative.
 COULOMB_CONSTANT = 332.0637132991921
-
-
-def _lennard_jones(r: torch.Tensor, epsilon: float, sigma: float) -> torch.Tensor:
-    sr6 = (sigma / r) ** 6
-    return 4.0 * epsilon * (sr6 * sr6 - sr6)
 
 
 class QTIP4PF(torch.nn.Module):
@@ -88,8 +83,6 @@ class QTIP4PF(torch.nn.Module):
 
         self._epsilon = p["epsilon"]
         self._sigma = p["sigma"]
-        self._q_H = 0.5 * p["q_M"]
-        self._q_M = -p["q_M"]
         self._gamma = p["gamma"]
         self._D_r = p["D_r"]
         self._alpha_r = p["alpha_r"]
@@ -98,12 +91,20 @@ class QTIP4PF(torch.nn.Module):
         self._theta_eq = p["theta_eq"] * math.pi / 180.0
         self._k_e = COULOMB_CONSTANT
 
-        # charges on (H1, H2, M). This is created here and not in forward, since
-        # `torch.tensor(List[float])` goes through float32 in TorchScript
+        # Charges on (H1, H2, M), and their products. These are created here and not
+        # in forward, since `torch.tensor(List[float])` goes through float32 in
+        # TorchScript
+        q_H = 0.5 * p["q_M"]
+        q_M = -p["q_M"]
+        charges = torch.tensor([q_H, q_H, q_M], dtype=torch.float64)
+        self.register_buffer("_charges", charges)
+        self.register_buffer("_qq", charges.reshape(3, 1) * charges.reshape(1, 3))
+        # charge products for the (H1, H2), (H2, M), (H1, M) pairs
         self.register_buffer(
-            "_charges",
-            torch.tensor([self._q_H, self._q_H, self._q_M], dtype=torch.float64),
+            "_intra_qq",
+            torch.tensor([q_H * q_H, q_H * q_M, q_H * q_M], dtype=torch.float64),
         )
+        self.register_buffer("_types", torch.tensor([8, 1, 1], dtype=torch.int32))
 
         self._cutoff = float(cutoff)
         # erfc(alpha r) ~ exp(-(alpha r)^2) ~ accuracy at r = cutoff - 2 A, and
@@ -111,6 +112,10 @@ class QTIP4PF(torch.nn.Module):
         log_acc = math.sqrt(-math.log(ewald_accuracy))
         self._ewald_alpha = log_acc / (self._cutoff - 2.0)
         self._ewald_kcut = 2.0 * self._ewald_alpha * log_acc
+        # interaction of each charge with its own gaussian, per molecule
+        self._ewald_self = (
+            self._k_e * self._ewald_alpha / math.sqrt(math.pi) * (2.0 * q_H**2 + q_M**2)
+        )
 
         self._nl_options = NeighborListOptions(
             cutoff=self._cutoff, full_list=False, strict=False
@@ -140,13 +145,11 @@ class QTIP4PF(torch.nn.Module):
                     "q-TIP4P/F can not compute the energy of a subset of atoms"
                 )
 
-        energies: List[torch.Tensor] = []
-        for system in systems:
-            energies.append(self.compute_energy(system))
+        energies = self.compute_energies(systems)
 
-        device = systems[0].positions.device
+        device = energies.device
         block = TensorBlock(
-            values=torch.stack(energies).reshape(-1, 1),
+            values=energies.reshape(-1, 1),
             samples=Labels(
                 ["system"], torch.arange(len(systems), device=device).reshape(-1, 1)
             ),
@@ -154,153 +157,287 @@ class QTIP4PF(torch.nn.Module):
             properties=Labels(["energy"], torch.tensor([[0]], device=device)),
         )
         return {
-            "energy": TensorMap(Labels("_", torch.tensor([[0]], device=device)), [block])
+            "energy": TensorMap(
+                Labels("_", torch.tensor([[0]], device=device)), [block]
+            )
         }
 
     def compute_energy(self, system: System) -> torch.Tensor:
         """Total q-TIP4P/F energy of a single system, in kcal/mol."""
-        types = system.types
-        positions = system.positions
-        cell = system.cell
+        return self.compute_energies([system])[0]
+
+    def compute_energies(self, systems: List[System]) -> torch.Tensor:
+        """
+        Total q-TIP4P/F energy of each system, in kcal/mol. Systems with the same
+        number of atoms and periodicity (e.g. the replicas of a path integral
+        simulation) are evaluated together.
+        """
+        n_systems = len(systems)
+        for system in systems:
+            if len(system) % 3 != 0:
+                raise ValueError(
+                    "q-TIP4P/F expects atoms ordered as O, H, H, O, H, H, ..."
+                )
+
+        # Everything that is needed on the host, gathered in a single transfer to
+        # avoid multiple synchronizations when running on GPU
+        types = torch.cat([system.types for system in systems])
+        pbc = torch.stack([system.pbc for system in systems])
+        cells = torch.stack([system.cell.detach() for system in systems])
+        dtype = cells.dtype
+        host: List[float] = torch.cat(
+            [
+                torch.all(types.reshape(-1, 3) == self._types).reshape(1).to(dtype),
+                pbc.reshape(-1).to(dtype),
+                torch.linalg.vector_norm(cells, dim=2).reshape(-1),
+            ]
+        ).tolist()
+        if host[0] != 1.0:
+            raise ValueError("q-TIP4P/F expects atoms ordered as O, H, H, O, H, H, ...")
+
+        periodic: List[bool] = []
+        n_max: List[List[int]] = []
+        for i in range(n_systems):
+            n_periodic = int(host[1 + 3 * i] + host[2 + 3 * i] + host[3 + 3 * i])
+            if n_periodic != 0 and n_periodic != 3:
+                raise ValueError(
+                    "q-TIP4P/F only supports fully periodic or non-periodic systems"
+                )
+            periodic.append(n_periodic == 3)
+            lengths = host[1 + 3 * n_systems + 3 * i : 4 + 3 * n_systems + 3 * i]
+            n_max.append(_ewald_n_max(lengths, self._ewald_kcut))
+
+        all_same = True
+        for i in range(n_systems):
+            if len(systems[i]) != len(systems[0]) or periodic[i] != periodic[0]:
+                all_same = False
+
+        energies: List[torch.Tensor] = []
+        if all_same:
+            # the reciprocal-space grid must contain the k-vectors of all systems
+            grid_n_max = [0, 0, 0]
+            for i in range(n_systems):
+                for d in range(3):
+                    grid_n_max[d] = max(grid_n_max[d], n_max[i][d])
+
+            # On CPU, evaluating many systems together is only faster as long as
+            # the intermediate arrays stay small, so systems are evaluated in
+            # chunks of about 1000 atoms
+            chunk = n_systems
+            if cells.device.type == "cpu":
+                chunk = max(1, 1000 // max(1, len(systems[0])))
+
+            for start in range(0, n_systems, chunk):
+                energies.append(
+                    self._energies(
+                        systems[start : start + chunk], periodic[0], grid_n_max
+                    )
+                )
+        else:
+            for i in range(n_systems):
+                energies.append(self._energies([systems[i]], periodic[i], n_max[i]))
+
+        return torch.cat(energies)
+
+    def _energies(
+        self, systems: List[System], periodic: bool, n_max: List[int]
+    ) -> torch.Tensor:
+        """
+        Energies of systems with the same number of atoms, which are all periodic
+        (``periodic=True``) or all non-periodic.
+        """
+        n_systems = len(systems)
+        positions = torch.stack([system.positions for system in systems])
+        cells = torch.stack([system.cell for system in systems])
         device = positions.device
         dtype = positions.dtype
-
-        n_atoms = types.shape[0]
-        if n_atoms % 3 != 0:
-            raise ValueError("q-TIP4P/F expects atoms ordered as O, H, H, O, H, H, ...")
-        n_molecules = n_atoms // 3
-        expected = torch.tensor([8, 1, 1], dtype=types.dtype, device=device)
-        if not bool(torch.all(types.reshape(n_molecules, 3) == expected)):
-            raise ValueError("q-TIP4P/F expects atoms ordered as O, H, H, O, H, H, ...")
-
-        n_periodic = int(system.pbc.sum())
-        if n_periodic != 0 and n_periodic != 3:
-            raise ValueError("q-TIP4P/F only supports fully periodic or non-periodic systems")
-        periodic = n_periodic == 3
+        n_molecules = positions.shape[1] // 3
 
         # ============================================================================ #
         # Intramolecular geometry
-        oxygens = positions[0::3]
-        d1 = positions[1::3] - oxygens
-        d2 = positions[2::3] - oxygens
+        positions = positions.reshape(n_systems, n_molecules, 3, 3)
+        oxygens = positions[:, :, 0]
+        # O-H vectors, shape (n_systems, n_molecules, 2, 3)
+        oh = positions[:, :, 1:] - positions[:, :, :1]
+        # only used for periodic systems
+        inverse = cells
+        volumes = cells[:, 0, 0]
         if periodic:
+            inverse, volumes = _inverse_cell(cells)
             # minimum image, so that molecules can be split across the boundary
-            inv_cell = torch.linalg.inv(cell)
-            d1 = d1 - torch.round(d1 @ inv_cell) @ cell
-            d2 = d2 - torch.round(d2 @ inv_cell) @ cell
+            images = torch.round(oh.reshape(n_systems, -1, 3) @ inverse) @ cells
+            oh = oh - images.reshape(oh.shape)
 
-        r1 = torch.linalg.vector_norm(d1, dim=1)
-        r2 = torch.linalg.vector_norm(d2, dim=1)
-        cos_theta = torch.sum(d1 * d2, dim=1)
-        sin_theta = torch.linalg.vector_norm(torch.linalg.cross(d1, d2), dim=1)
+        r_oh = torch.linalg.vector_norm(oh, dim=-1)
+        d1 = oh[:, :, 0]
+        d2 = oh[:, :, 1]
+        cos_theta = torch.sum(d1 * d2, dim=-1)
+        sin_theta = torch.linalg.vector_norm(torch.linalg.cross(d1, d2, dim=-1), dim=-1)
         theta = torch.atan2(sin_theta, cos_theta)
 
-        energy = torch.sum(self._stretch(r1) + self._stretch(r2))
-        energy = energy + 0.5 * self._k_theta * torch.sum((theta - self._theta_eq) ** 2)
+        a_dr = self._alpha_r * (r_oh - self._r_eq)
+        a_dr2 = a_dr * a_dr
+        stretch = a_dr2 * (1.0 - a_dr + (7.0 / 12.0) * a_dr2)
+        energies = self._D_r * torch.sum(stretch, dim=(1, 2))
+        bend = (theta - self._theta_eq) ** 2
+        energies = energies + 0.5 * self._k_theta * torch.sum(bend, dim=1)
 
-        # positions of the charged sites (H1, H2, M) relative to the oxygen
-        d_M = 0.5 * (1.0 - self._gamma) * (d1 + d2)
-        offsets = torch.stack([d1, d2, d_M], dim=1)
-        charges = self._charges.to(dtype=dtype, device=device)
-        qq = charges.reshape(3, 1) * charges.reshape(1, 3)
+        # positions of O and of the charged sites H1, H2, M, with shape
+        # (n_systems, n_molecules, 4, 3)
+        d_M = ((0.5 * (1.0 - self._gamma)) * (d1 + d2)).unsqueeze(2)
+        sites = oxygens.unsqueeze(2) + torch.cat(
+            [torch.zeros_like(d_M), oh, d_M], dim=2
+        )
+        qq = self._qq.to(dtype=dtype, device=device)
 
         # ============================================================================ #
-        # Intermolecular interactions
+        # Intermolecular interactions. Molecules are indexed over all systems.
         if periodic:
-            neighbors = system.get_neighbor_list(self._nl_options)
-            first = neighbors.samples.column("first_atom").to(torch.long)
-            second = neighbors.samples.column("second_atom").to(torch.long)
-            vectors = neighbors.values.reshape(-1, 3)
+            # only keep O-O pairs from the neighbor lists. Their vectors are recomputed
+            # from the positions instead of using `neighbors.values`, so that gradients
+            # only flow through these pairs.
+            samples: List[torch.Tensor] = []
+            shifts: List[torch.Tensor] = []
+            system_index: List[torch.Tensor] = []
+            for i, system in enumerate(systems):
+                neighbors = system.get_neighbor_list(self._nl_options)
+                samples.append(neighbors.samples.values)
+                shifts.append(neighbors.samples.values[:, 2:].to(dtype) @ system.cell)
+                n_pairs = neighbors.samples.values.shape[0]
+                system_index.append(
+                    torch.full((n_pairs,), i, dtype=torch.int32, device=device)
+                )
 
-            # only keep O-O pairs inside the cutoff
-            mask = torch.logical_and(first % 3 == 0, second % 3 == 0)
-            first = first[mask]
-            second = second[mask]
-            vectors = vectors[mask]
-            distances = torch.linalg.vector_norm(vectors, dim=1)
-            mask = distances < self._cutoff
-            mol_i = first[mask] // 3
-            mol_j = second[mask] // 3
-            vectors = vectors[mask]
-            distances = distances[mask]
+            is_oxygen = systems[0].types == 8
+            pairs = torch.cat(samples)
+            oo_pairs = torch.nonzero(is_oxygen[pairs[:, 0]] & is_oxygen[pairs[:, 1]])
+            oo_pairs = oo_pairs.reshape(-1)
+            pairs = pairs[oo_pairs]
+            shifts = torch.cat(shifts)[oo_pairs]
+            pair_system = torch.cat(system_index)[oo_pairs]
 
-            energy = energy + torch.sum(
-                _lennard_jones(distances, self._epsilon, self._sigma)
+            first = pair_system * n_molecules + pairs[:, 0] // 3
+            second = pair_system * n_molecules + pairs[:, 1] // 3
+
+            pair_energies = self._pair_energies(
+                sites.reshape(-1, 4, 3), first, second, shifts, qq, True
             )
+            energies = energies.index_add(0, pair_system, pair_energies)
 
-            # real-space Ewald, over all pairs of charged sites in these molecules
-            site_vectors = (
-                vectors.reshape(-1, 1, 1, 3)
-                + offsets[mol_j].reshape(-1, 1, 3, 3)
-                - offsets[mol_i].reshape(-1, 3, 1, 3)
+            # reciprocal-space Ewald
+            charged = sites[:, :, 1:].reshape(n_systems, -1, 3)
+            energies = energies + _ewald_reciprocal(
+                charged @ inverse,
+                self._charges.to(dtype=dtype, device=device).repeat(n_molecules),
+                inverse,
+                volumes,
+                n_max,
+                self._ewald_alpha,
+                self._ewald_kcut,
+                self._k_e,
             )
-            site_distances = torch.linalg.vector_norm(site_vectors, dim=-1)
-            energy = energy + self._k_e * torch.sum(
-                qq * torch.special.erfc(self._ewald_alpha * site_distances)
-                / site_distances
-            )
-
-            energy = energy + self._ewald_reciprocal(oxygens, offsets, charges, cell)
 
             # self-interaction of each charge with its own gaussian
-            energy = energy - (
-                self._k_e
-                * self._ewald_alpha
-                / math.sqrt(math.pi)
-                * n_molecules
-                * (2.0 * self._q_H**2 + self._q_M**2)
-            )
+            energies = energies - self._ewald_self * n_molecules
 
-            # remove the intramolecular interactions (H1-H2, H1-M, H2-M) that are
+            # remove the intramolecular interactions (H1-H2, H2-M, H1-M) that are
             # included in the reciprocal-space sum
-            intra = torch.stack([d2 - d1, d_M - d1, d_M - d2], dim=1)
+            intra = torch.cat(
+                [
+                    sites[:, :, 2:] - sites[:, :, 1:3],
+                    sites[:, :, 3:] - sites[:, :, 1:2],
+                ],
+                dim=2,
+            )
             intra_r = torch.linalg.vector_norm(intra, dim=-1)
-            # charge products for the (H1, H2), (H1, M), (H2, M) pairs
-            intra_qq = qq[[0, 0, 1], [1, 2, 2]]
-            energy = energy - self._k_e * torch.sum(
+            intra_qq = self._intra_qq.to(dtype=dtype, device=device)
+            exclusion = (
                 intra_qq * torch.special.erf(self._ewald_alpha * intra_r) / intra_r
             )
+            energies = energies - self._k_e * torch.sum(exclusion, dim=(1, 2))
         else:
             # direct sum over all pairs of molecules, no electrostatic cutoff
-            pairs = torch.triu_indices(n_molecules, n_molecules, offset=1, device=device)
-            mol_i = pairs[0]
-            mol_j = pairs[1]
-            vectors = oxygens[mol_j] - oxygens[mol_i]
-            distances = torch.linalg.vector_norm(vectors, dim=1)
-
-            lj = _lennard_jones(distances, self._epsilon, self._sigma)
-            energy = energy + torch.sum(
-                torch.where(distances < self._cutoff, lj, torch.zeros_like(lj))
+            pairs = torch.triu_indices(
+                n_molecules, n_molecules, offset=1, device=device
             )
-
-            site_vectors = (
-                vectors.reshape(-1, 1, 1, 3)
-                + offsets[mol_j].reshape(-1, 1, 3, 3)
-                - offsets[mol_i].reshape(-1, 3, 1, 3)
+            offsets = n_molecules * torch.arange(n_systems, device=device).reshape(
+                -1, 1
             )
-            site_distances = torch.linalg.vector_norm(site_vectors, dim=-1)
-            energy = energy + self._k_e * torch.sum(qq / site_distances)
+            pair_system = torch.arange(n_systems, device=device).repeat_interleave(
+                pairs.shape[1]
+            )
+            pair_energies = self._pair_energies(
+                sites.reshape(-1, 4, 3),
+                (pairs[0] + offsets).reshape(-1),
+                (pairs[1] + offsets).reshape(-1),
+                torch.zeros((1, 3), dtype=dtype, device=device),
+                qq,
+                False,
+            )
+            energies = energies.index_add(0, pair_system, pair_energies)
 
-        return energy
+        return energies
 
-    def _stretch(self, r: torch.Tensor) -> torch.Tensor:
-        a_dr = self._alpha_r * (r - self._r_eq)
-        a_dr2 = a_dr * a_dr
-        return self._D_r * (a_dr2 - a_dr2 * a_dr + (7.0 / 12.0) * a_dr2 * a_dr2)
-
-    def _ewald_reciprocal(
+    def _pair_energies(
         self,
-        oxygens: torch.Tensor,
-        offsets: torch.Tensor,
-        charges: torch.Tensor,
-        cell: torch.Tensor,
+        sites: torch.Tensor,
+        mol_i: torch.Tensor,
+        mol_j: torch.Tensor,
+        shifts: torch.Tensor,
+        qq: torch.Tensor,
+        ewald: bool,
     ) -> torch.Tensor:
-        """Reciprocal-space part of the Ewald sum, for charges at oxygens + offsets."""
-        sites = (oxygens.reshape(-1, 1, 3) + offsets).reshape(-1, 3)
-        site_charges = charges.repeat(oxygens.shape[0])
-        return ewald_reciprocal(
-            sites, site_charges, cell, self._ewald_alpha, self._ewald_kcut, self._k_e
+        """
+        Intermolecular energy for each pair of molecules (``mol_i``, ``mol_j``), with
+        ``sites[mol_j] + shifts`` being the periodic image of molecule j interacting
+        with molecule i: Lennard-Jones between oxygens within the cutoff, and either
+        the real-space part of the Ewald sum (``ewald=True``) or the bare Coulomb
+        interaction (``ewald=False``) between charged sites.
+        """
+        # Positions of (O, H1, H2, M) in molecules i and j, with shape (3, 4, n_pairs).
+        # The pairs are the last dimension to make element-wise operations efficient.
+        sites = sites.transpose(1, 2).reshape(-1, 12)
+        sites_i = sites[mol_i].T.contiguous().reshape(3, 4, -1)
+        sites_j = sites[mol_j].T.contiguous().reshape(3, 4, -1)
+        sites_j = sites_j + shifts.T.contiguous().reshape(3, 1, -1)
+
+        oo = sites_j[:, 0] - sites_i[:, 0]
+        r2_oo = torch.sum(oo * oo, dim=0)
+        sr6 = (self._sigma * self._sigma / r2_oo) ** 3
+        lj = 4.0 * self._epsilon * (sr6 * sr6 - sr6)
+
+        # vectors between the charged sites, with shape (3, 3, 3, n_pairs)
+        vectors = sites_j[:, 1:].reshape(3, 1, 3, -1) - sites_i[:, 1:].reshape(
+            3, 3, 1, -1
         )
+        r = torch.sqrt(torch.sum(vectors * vectors, dim=0))
+        qq = qq.reshape(3, 3, 1)
+
+        inside = r2_oo < self._cutoff * self._cutoff
+        if ewald:
+            coulomb = qq * torch.special.erfc(self._ewald_alpha * r) / r
+            energies = lj + self._k_e * torch.sum(coulomb, dim=(0, 1))
+            return torch.where(inside, energies, torch.zeros_like(energies))
+        else:
+            # Coulomb is not truncated for non-periodic systems
+            coulomb = self._k_e * torch.sum(qq / r, dim=(0, 1))
+            return coulomb + torch.where(inside, lj, torch.zeros_like(lj))
+
+
+def _inverse_cell(cells: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse and volume of a batch of cells, with lattice vectors as rows"""
+    # rows of the inverse transpose are (b x c, c x a, a x b) / det
+    cross = torch.linalg.cross(cells.roll(-1, dims=1), cells.roll(-2, dims=1), dim=-1)
+    det = torch.sum(cells[:, 0] * cross[:, 0], dim=-1)
+    return cross.transpose(1, 2) / det.reshape(-1, 1, 1), torch.abs(det)
+
+
+def _ewald_n_max(lengths: List[float], k_cut: float) -> List[int]:
+    """
+    Largest integer n_i such that |k| < k_cut is possible for k-vectors with
+    components n_i in the basis of the reciprocal lattice, since n_i = k . a_i / 2 pi
+    """
+    return [int(math.ceil(k_cut * length / (2.0 * math.pi))) for length in lengths]
 
 
 def ewald_reciprocal(
@@ -317,43 +454,99 @@ def ewald_reciprocal(
     with ``S(k) = sum_i q_i exp(i k r_i)``. ``cell`` contains the lattice vectors as
     rows, and can be triclinic.
     """
-    device = positions.device
-    dtype = positions.dtype
-
-    reciprocal = 2.0 * math.pi * torch.linalg.inv(cell).T
-    volume = torch.abs(torch.linalg.det(cell))
-
-    # largest integer n_i such that |k| < k_cut is possible, since n_i = k . a_i / 2 pi
-    lengths = torch.linalg.vector_norm(cell.detach(), dim=1)
-    n_max = torch.ceil(k_cut * lengths / (2.0 * math.pi)).to(torch.long)
-    n0 = torch.arange(0, int(n_max[0]) + 1, device=device)
-    n1 = torch.arange(-int(n_max[1]), int(n_max[1]) + 1, device=device)
-    n2 = torch.arange(-int(n_max[2]), int(n_max[2]) + 1, device=device)
-    n = torch.cartesian_prod(n0, n1, n2)
-
-    # only keep half of the k-vectors, since S(-k) = S(k)^*
-    half = torch.logical_or(
-        n[:, 0] > 0,
-        torch.logical_or(
-            torch.logical_and(n[:, 0] == 0, n[:, 1] > 0),
-            torch.logical_and(
-                torch.logical_and(n[:, 0] == 0, n[:, 1] == 0), n[:, 2] > 0
-            ),
-        ),
+    inverse, volume = _inverse_cell(cell.unsqueeze(0))
+    lengths: List[float] = torch.linalg.vector_norm(cell.detach(), dim=1).tolist()
+    energy = _ewald_reciprocal(
+        (positions @ inverse[0]).unsqueeze(0),
+        charges,
+        inverse,
+        volume,
+        _ewald_n_max(lengths, k_cut),
+        alpha,
+        k_cut,
+        k_e,
     )
-    n = n[half]
-    k_vectors = n.to(dtype) @ reciprocal
-    k2 = torch.sum(k_vectors**2, dim=1)
-    inside = k2.detach() < k_cut * k_cut
-    k_vectors = k_vectors[inside]
-    k2 = k2[inside]
+    return energy[0]
 
-    phases = positions @ k_vectors.T
-    s_cos = charges @ torch.cos(phases)
-    s_sin = charges @ torch.sin(phases)
 
-    # factor 2 for the k-vectors in the other half of reciprocal space
-    prefactor = 4.0 * math.pi * k_e / volume
-    return prefactor * torch.sum(
-        torch.exp(-k2 / (4.0 * alpha * alpha)) / k2 * (s_cos**2 + s_sin**2)
+def _ewald_reciprocal(
+    fractional: torch.Tensor,
+    charges: torch.Tensor,
+    inverse: torch.Tensor,
+    volumes: torch.Tensor,
+    n_max: List[int],
+    alpha: float,
+    k_cut: float,
+    k_e: float,
+) -> torch.Tensor:
+    """
+    Implementation of :py:func:`ewald_reciprocal` for a batch of systems with the
+    same number of charges, from the fractional coordinates ``s_i`` of the charges
+    (shape ``(n_systems, n_charges, 3)``), the inverse of the cells, their volumes,
+    and the largest components of the k-vectors along each reciprocal lattice vector.
+
+    With ``k = 2 pi n @ inverse.T`` for integer ``n``, ``exp(i k r) = exp(2 pi i n_0
+    s_0) exp(2 pi i n_1 s_1) exp(2 pi i n_2 s_2)``, and the structure factors on the
+    full grid of ``n`` are computed with a single matrix multiplication. This uses
+    real arithmetic, since complex operations are slow on CPU.
+    """
+    device = fractional.device
+    dtype = fractional.dtype
+    n_systems = fractional.shape[0]
+    n_sites = fractional.shape[1]
+
+    # values of n along each direction. Only n_0 >= 0 is needed since S(-k) = S(k)^*
+    m = max(n_max)
+    n = torch.arange(-m, m + 1, dtype=dtype, device=device)
+    range_0 = (m, m + n_max[0] + 1)
+    range_1 = (m - n_max[1], m + n_max[1] + 1)
+    range_2 = (m - n_max[2], m + n_max[2] + 1)
+    size_01 = (range_0[1] - range_0[0]) * (range_1[1] - range_1[0])
+    size_2 = range_2[1] - range_2[0]
+
+    # cos and sin of 2 pi n s for all sites, directions and values of n
+    angles = (2.0 * math.pi) * fractional.unsqueeze(3) * n
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    # exp(2 pi i (n_0 s_0 + n_1 s_1)), for all (n_0, n_1)
+    shape_0 = (n_systems, n_sites, -1, 1)
+    shape_1 = (n_systems, n_sites, 1, -1)
+    cos_0 = cos[:, :, 0, range_0[0] : range_0[1]].reshape(shape_0)
+    sin_0 = sin[:, :, 0, range_0[0] : range_0[1]].reshape(shape_0)
+    cos_1 = cos[:, :, 1, range_1[0] : range_1[1]].reshape(shape_1)
+    sin_1 = sin[:, :, 1, range_1[0] : range_1[1]].reshape(shape_1)
+    cos_01 = (cos_0 * cos_1 - sin_0 * sin_1).reshape(n_systems, n_sites, size_01)
+    sin_01 = (sin_0 * cos_1 + cos_0 * sin_1).reshape(n_systems, n_sites, size_01)
+
+    # real and imaginary parts of the structure factors S(n_0, n_1, n_2), from
+    # the products of the (cos_01, sin_01) and (q cos_2, q sin_2) blocks
+    charges = charges.reshape(1, n_sites, 1)
+    cos_2 = charges * cos[:, :, 2, range_2[0] : range_2[1]]
+    sin_2 = charges * sin[:, :, 2, range_2[0] : range_2[1]]
+    products = torch.cat([cos_01, sin_01], dim=2).transpose(1, 2) @ torch.cat(
+        [cos_2, sin_2], dim=2
     )
+    s_real = products[:, :size_01, :size_2] - products[:, size_01:, size_2:]
+    s_imag = products[:, :size_01, size_2:] + products[:, size_01:, :size_2]
+    s2 = (s_real * s_real + s_imag * s_imag).reshape(n_systems, -1)
+
+    n_0 = n[range_0[0] : range_0[1]]
+    grid = torch.meshgrid(
+        [n_0, n[range_1[0] : range_1[1]], n[range_2[0] : range_2[1]]], indexing="ij"
+    )
+    # k-vectors are computed with element-wise operations instead of a matrix
+    # multiplication, which could round differently for different numbers of systems.
+    # This way, the k-vectors inside the cutoff are the same when evaluating systems
+    # one by one or together.
+    grid = torch.stack(grid).reshape(1, 1, 3, -1)
+    k_vectors = torch.sum(((2.0 * math.pi) * inverse).unsqueeze(3) * grid, dim=2)
+    k2 = torch.sum(k_vectors * k_vectors, dim=1)
+
+    # n = 0 is excluded, and the n_0 = 0 plane contains both k and -k
+    inside = torch.logical_and(k2 > 0.0, k2 < k_cut * k_cut)
+    k2 = torch.where(inside, k2, torch.ones_like(k2))
+    weights = torch.where(inside, torch.exp(-k2 / (4.0 * alpha * alpha)) / k2, 0.0)
+    weights = torch.where(grid[0, 0, 0] > 0, weights, 0.5 * weights)
+
+    return (4.0 * math.pi * k_e) / volumes * torch.sum(weights * s2, dim=1)

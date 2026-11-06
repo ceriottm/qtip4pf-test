@@ -46,11 +46,12 @@ def read_xyz(path):
 
 def make_system(module, types, positions, cell, pbc=True):
     """Create a metatomic System, with neighbor lists for `module`."""
+    device = positions.device
     system = System(
-        types=torch.as_tensor(types, dtype=torch.int32),
+        types=torch.as_tensor(types, dtype=torch.int32, device=device),
         positions=positions,
         cell=cell,
-        pbc=torch.tensor([pbc, pbc, pbc]),
+        pbc=torch.tensor([pbc, pbc, pbc], device=device),
     )
     for options in module.requested_neighbor_lists():
         NeighborList(options, "angstrom").add_neighbor_list([system])

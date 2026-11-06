@@ -71,7 +71,7 @@ def get_model(
         authors=["Michele Ceriotti <michele.ceriotti@epfl.ch>"],
         references={
             "model": ["https://doi.org/10.1063/1.3167790"],
-            "implementation": ["https://github.com/metatensor/qtip4pf"],
+            "implementation": ["https://github.com/ceriottm/qtip4pf-test"],
         },
     )
 

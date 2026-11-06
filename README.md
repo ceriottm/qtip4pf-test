@@ -9,8 +9,10 @@ standalone TorchScript file and run in any engine that supports metatomic models
 
 ## Installation and usage
 
+The package is not on PyPI; install it directly from GitHub:
+
 ```bash
-pip install metatomic-qtip4pf
+pip install git+https://github.com/ceriottm/qtip4pf-test
 
 # export the model to qtip4pf.pt
 metatomic-qtip4pf -o qtip4pf.pt
@@ -57,8 +59,42 @@ Some implementation choices:
 - **Periodic electrostatics** uses an Ewald sum with conducting boundary conditions.
   - The real-space sum includes all charge pairs from molecules whose O–O distance is below `cutoff` (a molecule-based cutoff).
   - The splitting parameter and the reciprocal-space cutoff come from `ewald_accuracy` (default 1e-6). For a 216-molecule box, the defaults give energies within 4·10⁻⁶ (relative) of the fully converged Ewald sum and forces within 10⁻⁴ kcal/mol/Å.
-  - The cost of this plain Ewald sum grows roughly as N² at fixed cutoff. On a CPU, energy, forces and virial take about 0.3 s for 216 molecules and 7 s for 1728 molecules.
+  - The cost of this plain Ewald sum grows roughly as N² at fixed cutoff, so the model is meant for small boxes, up to a few hundred molecules (see [Performance](#performance)).
 - **Non-periodic systems** use a direct Coulomb sum over all pairs of molecules, without cutoff.
+
+## Performance
+
+This is a test potential for small boxes. Systems with the same number of atoms that
+are passed to the model in a single call (e.g. the beads of a path integral
+simulation in i-PI) are evaluated together. On GPU, this removes most of the
+overhead of launching many small kernels. On CPU, systems are evaluated in chunks of
+about 1000 atoms.
+
+Time (ms per system) for energy, forces and virial with the exported model, without
+the neighbor list (computed by the simulation engine), for boxes of water at
+0.997 g/cm³ and one or 32 systems per call:
+
+| molecules | CPU (1 core), 1 | CPU (1 core), 32 | H100, 1 | H100, 32 | L40S, 1 | L40S, 32 |
+|---|---|---|---|---|---|---|
+| 32 | 3.9 | 2.4 | 4.8 | 0.58 | 4.6 | 0.55 |
+| 64 | 5.7 | 4.5 | 5.1 | 0.59 | 4.9 | 0.64 |
+| 128 | 11.3 | 10.4 | 5.2 | 0.60 | 5.0 | 0.86 |
+| 216 | 20.4 | 20.3 | 5.2 | 0.65 | 5.1 | 1.28 |
+
+A single small system on GPU is limited by kernel launch overhead, so it is not
+faster than on CPU. On CPU, the default glibc memory allocator returns large blocks
+to the operating system after each evaluation, and then has to map them again.
+Preloading jemalloc (`LD_PRELOAD=/path/to/libjemalloc.so.2`) or setting
+`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1073741824:glibc.malloc.trim_threshold=1073741824`
+makes CPU evaluations about 30% faster.
+
+These numbers come from [`benchmarks/benchmark.py`](benchmarks/benchmark.py), which
+follows what i-PI does at each step:
+
+```bash
+python benchmarks/benchmark.py --device cpu --threads 1 --batch 1 32
+python benchmarks/benchmark.py --device cuda --batch 1 32
+```
 
 ## Validation
 
@@ -70,9 +106,11 @@ The test suite checks:
 - energy, forces and virial for a 216-molecule box against the Fortran q-TIP4P/F implementation shipped with i-PI (see [`tests/data/README.md`](tests/data/README.md)). The agreement is ~10⁻⁹ (relative) when both Ewald sums are converged;
 - that the exported TorchScript model reproduces the Python one, with automatic unit conversion.
 
-Run the tests with:
+Run the tests from a clone of the repository with:
 
 ```bash
+git clone https://github.com/ceriottm/qtip4pf-test
+cd qtip4pf-test
 pip install ".[test]"
 pytest
 ```

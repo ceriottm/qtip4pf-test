@@ -27,7 +27,7 @@ test = ["pytest", "vesin >=0.4"]
 metatomic-qtip4pf = "metatomic_qtip4pf._cli:main"
 
 [project.urls]
-repository = "https://github.com/metatensor/qtip4pf"
+repository = "https://github.com/ceriottm/qtip4pf-test"
 
 [build-system]
 requires = ["setuptools >=77", "setuptools-scm >=8"]
