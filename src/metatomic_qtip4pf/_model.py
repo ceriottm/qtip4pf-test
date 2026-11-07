@@ -147,20 +147,18 @@ class QTIP4PF(torch.nn.Module):
 
         energies = self.compute_energies(systems)
 
+        # Labels are created directly on the device, and marked as unique, to avoid
+        # copies between host and device (which synchronize them)
         device = energies.device
+        zero = torch.zeros((1, 1), dtype=torch.int32, device=device)
+        system = torch.arange(len(systems), dtype=torch.int32, device=device)
         block = TensorBlock(
             values=energies.reshape(-1, 1),
-            samples=Labels(
-                ["system"], torch.arange(len(systems), device=device).reshape(-1, 1)
-            ),
+            samples=Labels(["system"], system.reshape(-1, 1), assume_unique=True),
             components=torch.jit.annotate(List[Labels], []),
-            properties=Labels(["energy"], torch.tensor([[0]], device=device)),
+            properties=Labels(["energy"], zero, assume_unique=True),
         )
-        return {
-            "energy": TensorMap(
-                Labels("_", torch.tensor([[0]], device=device)), [block]
-            )
-        }
+        return {"energy": TensorMap(Labels("_", zero, assume_unique=True), [block])}
 
     def compute_energy(self, system: System) -> torch.Tensor:
         """Total q-TIP4P/F energy of a single system, in kcal/mol."""
@@ -253,15 +251,19 @@ class QTIP4PF(torch.nn.Module):
         dtype = positions.dtype
         n_molecules = positions.shape[1] // 3
 
+        # Tensors that require gradients are split with `unbind` and gathered with
+        # `index_select` rather than sliced or indexed: on GPU, the cost is dominated
+        # by the number of kernels, and the backward of slicing and indexing needs
+        # several of them (zero-filled copies, sorting of indices) for each slice.
+
         # ============================================================================ #
         # Intramolecular geometry
-        positions = positions.reshape(n_systems, n_molecules, 3, 3)
-        oxygens = positions[:, :, 0]
+        atoms = positions.reshape(n_systems, n_molecules, 3, 3).unbind(2)
+        oxygens = atoms[0]
         # O-H vectors, shape (n_systems, n_molecules, 2, 3)
-        oh = positions[:, :, 1:] - positions[:, :, :1]
+        oh = torch.stack([atoms[1] - oxygens, atoms[2] - oxygens], dim=2)
         # only used for periodic systems
-        inverse = cells
-        volumes = cells[:, 0, 0]
+        inverse, volumes = cells, cells
         if periodic:
             inverse, volumes = _inverse_cell(cells)
             # minimum image, so that molecules can be split across the boundary
@@ -269,8 +271,9 @@ class QTIP4PF(torch.nn.Module):
             oh = oh - images.reshape(oh.shape)
 
         r_oh = torch.linalg.vector_norm(oh, dim=-1)
-        d1 = oh[:, :, 0]
-        d2 = oh[:, :, 1]
+        oh_vectors = oh.unbind(2)
+        d1 = oh_vectors[0]
+        d2 = oh_vectors[1]
         cos_theta = torch.sum(d1 * d2, dim=-1)
         sin_theta = torch.linalg.vector_norm(torch.linalg.cross(d1, d2, dim=-1), dim=-1)
         theta = torch.atan2(sin_theta, cos_theta)
@@ -282,13 +285,18 @@ class QTIP4PF(torch.nn.Module):
         bend = (theta - self._theta_eq) ** 2
         energies = energies + 0.5 * self._k_theta * torch.sum(bend, dim=1)
 
-        # positions of O and of the charged sites H1, H2, M, with shape
-        # (n_systems, n_molecules, 4, 3)
-        d_M = ((0.5 * (1.0 - self._gamma)) * (d1 + d2)).unsqueeze(2)
-        sites = oxygens.unsqueeze(2) + torch.cat(
-            [torch.zeros_like(d_M), oh, d_M], dim=2
-        )
+        # charged sites H1, H2, M relative to the oxygen of their molecule, with shape
+        # (n_systems, n_molecules, 3, 3)
+        d_M = (0.5 * (1.0 - self._gamma)) * (d1 + d2)
+        charged = torch.stack([d1, d2, d_M], dim=2)
         qq = self._qq.to(dtype=dtype, device=device)
+
+        # Positions of the oxygens, with shape (3, n_molecules_total), and of the
+        # charged sites relative to the oxygens, with shape (3 * 3, n_molecules_total)
+        # for (xyz, site), for all molecules in all systems. Molecules are the last
+        # dimension to make element-wise operations over pairs efficient.
+        oxygens_xyz = oxygens.reshape(-1, 3).T
+        charged_xyz = charged.transpose(2, 3).reshape(-1, 9).T
 
         # ============================================================================ #
         # Intermolecular interactions. Molecules are indexed over all systems.
@@ -300,12 +308,11 @@ class QTIP4PF(torch.nn.Module):
             shifts: List[torch.Tensor] = []
             system_index: List[torch.Tensor] = []
             for i, system in enumerate(systems):
-                neighbors = system.get_neighbor_list(self._nl_options)
-                samples.append(neighbors.samples.values)
-                shifts.append(neighbors.samples.values[:, 2:].to(dtype) @ system.cell)
-                n_pairs = neighbors.samples.values.shape[0]
+                values = system.get_neighbor_list(self._nl_options).samples.values
+                samples.append(values)
+                shifts.append(values[:, 2:].to(dtype) @ system.cell)
                 system_index.append(
-                    torch.full((n_pairs,), i, dtype=torch.int32, device=device)
+                    torch.full((values.shape[0],), i, dtype=torch.int32, device=device)
                 )
 
             is_oxygen = systems[0].types == 8
@@ -313,21 +320,23 @@ class QTIP4PF(torch.nn.Module):
             oo_pairs = torch.nonzero(is_oxygen[pairs[:, 0]] & is_oxygen[pairs[:, 1]])
             oo_pairs = oo_pairs.reshape(-1)
             pairs = pairs[oo_pairs]
-            shifts = torch.cat(shifts)[oo_pairs]
             pair_system = torch.cat(system_index)[oo_pairs]
 
-            first = pair_system * n_molecules + pairs[:, 0] // 3
-            second = pair_system * n_molecules + pairs[:, 1] // 3
-
             pair_energies = self._pair_energies(
-                sites.reshape(-1, 4, 3), first, second, shifts, qq, True
+                oxygens_xyz,
+                charged_xyz,
+                pair_system * n_molecules + pairs[:, 0] // 3,
+                pair_system * n_molecules + pairs[:, 1] // 3,
+                torch.index_select(torch.cat(shifts), 0, oo_pairs).T,
+                qq,
+                True,
             )
             energies = energies.index_add(0, pair_system, pair_energies)
 
             # reciprocal-space Ewald
-            charged = sites[:, :, 1:].reshape(n_systems, -1, 3)
+            sites = (oxygens.unsqueeze(2) + charged).reshape(n_systems, -1, 3)
             energies = energies + _ewald_reciprocal(
-                charged @ inverse,
+                sites @ inverse,
                 self._charges.to(dtype=dtype, device=device).repeat(n_molecules),
                 inverse,
                 volumes,
@@ -342,13 +351,7 @@ class QTIP4PF(torch.nn.Module):
 
             # remove the intramolecular interactions (H1-H2, H2-M, H1-M) that are
             # included in the reciprocal-space sum
-            intra = torch.cat(
-                [
-                    sites[:, :, 2:] - sites[:, :, 1:3],
-                    sites[:, :, 3:] - sites[:, :, 1:2],
-                ],
-                dim=2,
-            )
+            intra = torch.stack([d2 - d1, d_M - d2, d_M - d1], dim=2)
             intra_r = torch.linalg.vector_norm(intra, dim=-1)
             intra_qq = self._intra_qq.to(dtype=dtype, device=device)
             exclusion = (
@@ -367,10 +370,11 @@ class QTIP4PF(torch.nn.Module):
                 pairs.shape[1]
             )
             pair_energies = self._pair_energies(
-                sites.reshape(-1, 4, 3),
+                oxygens_xyz,
+                charged_xyz,
                 (pairs[0] + offsets).reshape(-1),
                 (pairs[1] + offsets).reshape(-1),
-                torch.zeros((1, 3), dtype=dtype, device=device),
+                torch.zeros((3, 1), dtype=dtype, device=device),
                 qq,
                 False,
             )
@@ -380,7 +384,8 @@ class QTIP4PF(torch.nn.Module):
 
     def _pair_energies(
         self,
-        sites: torch.Tensor,
+        oxygens: torch.Tensor,
+        charged: torch.Tensor,
         mol_i: torch.Tensor,
         mol_j: torch.Tensor,
         shifts: torch.Tensor,
@@ -389,27 +394,27 @@ class QTIP4PF(torch.nn.Module):
     ) -> torch.Tensor:
         """
         Intermolecular energy for each pair of molecules (``mol_i``, ``mol_j``), with
-        ``sites[mol_j] + shifts`` being the periodic image of molecule j interacting
-        with molecule i: Lennard-Jones between oxygens within the cutoff, and either
-        the real-space part of the Ewald sum (``ewald=True``) or the bare Coulomb
-        interaction (``ewald=False``) between charged sites.
-        """
-        # Positions of (O, H1, H2, M) in molecules i and j, with shape (3, 4, n_pairs).
-        # The pairs are the last dimension to make element-wise operations efficient.
-        sites = sites.transpose(1, 2).reshape(-1, 12)
-        sites_i = sites[mol_i].T.contiguous().reshape(3, 4, -1)
-        sites_j = sites[mol_j].T.contiguous().reshape(3, 4, -1)
-        sites_j = sites_j + shifts.T.contiguous().reshape(3, 1, -1)
+        ``shifts`` (shape ``(3, n_pairs)``) translating molecule j to its periodic
+        image interacting with molecule i: Lennard-Jones between oxygens within the
+        cutoff, and either the real-space part of the Ewald sum (``ewald=True``) or the
+        bare Coulomb interaction (``ewald=False``) between charged sites.
 
-        oo = sites_j[:, 0] - sites_i[:, 0]
+        ``oxygens`` (shape ``(3, n_molecules)``) contains the positions of the oxygens,
+        and ``charged`` (shape ``(3 * 3, n_molecules)``) those of the charged sites
+        relative to the oxygens.
+        """
+        n_pairs = mol_i.shape[0]
+        oxygens_i = torch.index_select(oxygens, 1, mol_i)
+        oxygens_j = torch.index_select(oxygens, 1, mol_j)
+        oo = oxygens_j - oxygens_i + shifts
         r2_oo = torch.sum(oo * oo, dim=0)
         sr6 = (self._sigma * self._sigma / r2_oo) ** 3
         lj = 4.0 * self._epsilon * (sr6 * sr6 - sr6)
 
         # vectors between the charged sites, with shape (3, 3, 3, n_pairs)
-        vectors = sites_j[:, 1:].reshape(3, 1, 3, -1) - sites_i[:, 1:].reshape(
-            3, 3, 1, -1
-        )
+        charged_i = torch.index_select(charged, 1, mol_i).reshape(3, 3, 1, n_pairs)
+        charged_j = torch.index_select(charged, 1, mol_j).reshape(3, 1, 3, n_pairs)
+        vectors = (oo.reshape(3, 1, 1, n_pairs) + charged_j) - charged_i
         r = torch.sqrt(torch.sum(vectors * vectors, dim=0))
         qq = qq.reshape(3, 3, 1)
 
@@ -428,7 +433,8 @@ def _inverse_cell(cells: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Inverse and volume of a batch of cells, with lattice vectors as rows"""
     # rows of the inverse transpose are (b x c, c x a, a x b) / det
     cross = torch.linalg.cross(cells.roll(-1, dims=1), cells.roll(-2, dims=1), dim=-1)
-    det = torch.sum(cells[:, 0] * cross[:, 0], dim=-1)
+    # a . (b x c) = b . (c x a) = c . (a x b) = det
+    det = torch.sum(cells * cross, dim=(1, 2)) / 3.0
     return cross.transpose(1, 2) / det.reshape(-1, 1, 1), torch.abs(det)
 
 
@@ -496,57 +502,56 @@ def _ewald_reciprocal(
     n_sites = fractional.shape[1]
 
     # values of n along each direction. Only n_0 >= 0 is needed since S(-k) = S(k)^*
-    m = max(n_max)
-    n = torch.arange(-m, m + 1, dtype=dtype, device=device)
-    range_0 = (m, m + n_max[0] + 1)
-    range_1 = (m - n_max[1], m + n_max[1] + 1)
-    range_2 = (m - n_max[2], m + n_max[2] + 1)
-    size_01 = (range_0[1] - range_0[0]) * (range_1[1] - range_1[0])
-    size_2 = range_2[1] - range_2[0]
+    n_0 = torch.arange(0, n_max[0] + 1, dtype=dtype, device=device)
+    n_1 = torch.arange(-n_max[1], n_max[1] + 1, dtype=dtype, device=device)
+    n_2 = torch.arange(-n_max[2], n_max[2] + 1, dtype=dtype, device=device)
+    size_01 = n_0.shape[0] * n_1.shape[0]
+    size_2 = n_2.shape[0]
 
-    # cos and sin of 2 pi n s for all sites, directions and values of n
-    angles = (2.0 * math.pi) * fractional.unsqueeze(3) * n
-    cos = torch.cos(angles)
-    sin = torch.sin(angles)
+    # 2 pi n s for all sites and values of n, along each direction
+    s = ((2.0 * math.pi) * fractional).unbind(2)
+    angles_0 = s[0].unsqueeze(2) * n_0
+    angles_1 = s[1].unsqueeze(2) * n_1
+    angles_2 = s[2].unsqueeze(2) * n_2
 
     # exp(2 pi i (n_0 s_0 + n_1 s_1)), for all (n_0, n_1)
-    shape_0 = (n_systems, n_sites, -1, 1)
-    shape_1 = (n_systems, n_sites, 1, -1)
-    cos_0 = cos[:, :, 0, range_0[0] : range_0[1]].reshape(shape_0)
-    sin_0 = sin[:, :, 0, range_0[0] : range_0[1]].reshape(shape_0)
-    cos_1 = cos[:, :, 1, range_1[0] : range_1[1]].reshape(shape_1)
-    sin_1 = sin[:, :, 1, range_1[0] : range_1[1]].reshape(shape_1)
+    cos_0 = torch.cos(angles_0).unsqueeze(3)
+    sin_0 = torch.sin(angles_0).unsqueeze(3)
+    cos_1 = torch.cos(angles_1).unsqueeze(2)
+    sin_1 = torch.sin(angles_1).unsqueeze(2)
     cos_01 = (cos_0 * cos_1 - sin_0 * sin_1).reshape(n_systems, n_sites, size_01)
     sin_01 = (sin_0 * cos_1 + cos_0 * sin_1).reshape(n_systems, n_sites, size_01)
 
     # real and imaginary parts of the structure factors S(n_0, n_1, n_2), from
     # the products of the (cos_01, sin_01) and (q cos_2, q sin_2) blocks
     charges = charges.reshape(1, n_sites, 1)
-    cos_2 = charges * cos[:, :, 2, range_2[0] : range_2[1]]
-    sin_2 = charges * sin[:, :, 2, range_2[0] : range_2[1]]
+    cos_2 = charges * torch.cos(angles_2)
+    sin_2 = charges * torch.sin(angles_2)
     products = torch.cat([cos_01, sin_01], dim=2).transpose(1, 2) @ torch.cat(
         [cos_2, sin_2], dim=2
     )
-    s_real = products[:, :size_01, :size_2] - products[:, size_01:, size_2:]
-    s_imag = products[:, :size_01, size_2:] + products[:, size_01:, :size_2]
+    blocks = products.reshape(n_systems, 2, size_01, 2, size_2).unbind(1)
+    cos_01_blocks = blocks[0].unbind(2)
+    sin_01_blocks = blocks[1].unbind(2)
+    s_real = cos_01_blocks[0] - sin_01_blocks[1]
+    s_imag = cos_01_blocks[1] + sin_01_blocks[0]
     s2 = (s_real * s_real + s_imag * s_imag).reshape(n_systems, -1)
 
-    n_0 = n[range_0[0] : range_0[1]]
-    grid = torch.meshgrid(
-        [n_0, n[range_1[0] : range_1[1]], n[range_2[0] : range_2[1]]], indexing="ij"
-    )
-    # k-vectors are computed with element-wise operations instead of a matrix
-    # multiplication, which could round differently for different numbers of systems.
-    # This way, the k-vectors inside the cutoff are the same when evaluating systems
-    # one by one or together.
-    grid = torch.stack(grid).reshape(1, 1, 3, -1)
-    k_vectors = torch.sum(((2.0 * math.pi) * inverse).unsqueeze(3) * grid, dim=2)
-    k2 = torch.sum(k_vectors * k_vectors, dim=1)
+    # |k|^2 = (2 pi)^2 n^T G n with the metric G = inverse^T inverse, for all n on
+    # the grid. This uses element-wise operations instead of matrix multiplications,
+    # which could round differently for different numbers of systems. This way, the
+    # k-vectors inside the cutoff are the same when evaluating systems one by one or
+    # together.
+    grid = torch.stack(torch.meshgrid([n_0, n_1, n_2], indexing="ij")).reshape(3, -1)
+    nn = (grid.unsqueeze(1) * grid.unsqueeze(0)).reshape(1, 9, -1)
+    metric = torch.sum(inverse.unsqueeze(3) * inverse.unsqueeze(2), dim=1)
+    k2 = torch.sum(metric.reshape(n_systems, 9, 1) * nn, dim=1)
+    k2 = (4.0 * math.pi * math.pi) * k2
 
     # n = 0 is excluded, and the n_0 = 0 plane contains both k and -k
     inside = torch.logical_and(k2 > 0.0, k2 < k_cut * k_cut)
     k2 = torch.where(inside, k2, torch.ones_like(k2))
     weights = torch.where(inside, torch.exp(-k2 / (4.0 * alpha * alpha)) / k2, 0.0)
-    weights = torch.where(grid[0, 0, 0] > 0, weights, 0.5 * weights)
+    weights = torch.where(grid[0] > 0, weights, 0.5 * weights)
 
     return (4.0 * math.pi * k_e) / volumes * torch.sum(weights * s2, dim=1)

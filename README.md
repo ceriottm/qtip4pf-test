@@ -76,14 +76,17 @@ the neighbor list (computed by the simulation engine), for boxes of water at
 
 | molecules | CPU (1 core), 1 | CPU (1 core), 32 | H100, 1 | H100, 32 | L40S, 1 | L40S, 32 |
 |---|---|---|---|---|---|---|
-| 32 | 3.9 | 2.4 | 4.8 | 0.58 | 4.6 | 0.55 |
-| 64 | 5.7 | 4.5 | 5.1 | 0.59 | 4.9 | 0.64 |
-| 128 | 11.3 | 10.4 | 5.2 | 0.60 | 5.0 | 0.86 |
-| 216 | 20.4 | 20.3 | 5.2 | 0.65 | 5.1 | 1.28 |
+| 32 | 3.9 | 2.6 | 4.0 | 0.56 | 3.8 | 0.53 |
+| 64 | 5.9 | 4.9 | 4.0 | 0.56 | 3.8 | 0.62 |
+| 128 | 11.5 | 10.8 | 4.2 | 0.58 | 4.1 | 0.83 |
+| 216 | 21.6 | 20.6 | 4.3 | 0.60 | 4.3 | 1.22 |
 
-A single small system on GPU is limited by kernel launch overhead, so it is not
-faster than on CPU. On CPU, the default glibc memory allocator returns large blocks
-to the operating system after each evaluation, and then has to map them again.
+On GPU, the time for a single small system (~4 ms) does not depend on its size: it
+is spent launching several hundred small operations, so the GPU only pays off for
+larger boxes or for many systems evaluated together.
+
+On CPU, the default glibc memory allocator returns large blocks to the operating
+system after each evaluation, and then has to map them again.
 Preloading jemalloc (`LD_PRELOAD=/path/to/libjemalloc.so.2`) or setting
 `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1073741824:glibc.malloc.trim_threshold=1073741824`
 makes CPU evaluations about 30% faster.
