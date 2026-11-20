@@ -5,3 +5,4 @@ dist/
 .tox/
 *.pt
 src/metatomic_qtip4pf/_version.py
+.venv/

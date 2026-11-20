@@ -44,8 +44,11 @@ def read_xyz(path):
     return np.array(types), np.array(positions), cell
 
 
-def make_system(module, types, positions, cell, pbc=True):
-    """Create a metatomic System, with neighbor lists for `module`."""
+def make_system(module, types, positions, cell, pbc=True, calculators=None):
+    """
+    Create a metatomic System, with neighbor lists for `module`, from new neighbor
+    list calculators or from the given ones.
+    """
     device = positions.device
     system = System(
         types=torch.as_tensor(types, dtype=torch.int32, device=device),
@@ -53,12 +56,17 @@ def make_system(module, types, positions, cell, pbc=True):
         cell=cell,
         pbc=torch.tensor([pbc, pbc, pbc], device=device),
     )
-    for options in module.requested_neighbor_lists():
-        NeighborList(options, "angstrom").add_neighbor_list([system])
+    if calculators is None:
+        calculators = [
+            NeighborList(options, "angstrom")
+            for options in module.requested_neighbor_lists()
+        ]
+    for calculator in calculators:
+        calculator.add_neighbor_list([system])
     return system
 
 
-def evaluate(module, types, positions, cell, pbc=True):
+def evaluate(module, types, positions, cell, pbc=True, calculators=None):
     """
     Energy (kcal/mol), forces (kcal/mol/A) and virial (-dE/dstrain, kcal/mol) from
     the eager module, computing derivatives with respect to positions and strain in
@@ -67,7 +75,9 @@ def evaluate(module, types, positions, cell, pbc=True):
     positions = torch.tensor(positions, dtype=torch.float64, requires_grad=True)
     cell = torch.tensor(cell, dtype=torch.float64)
     strain = torch.eye(3, dtype=torch.float64, requires_grad=True)
-    system = make_system(module, types, positions @ strain, cell @ strain, pbc)
+    system = make_system(
+        module, types, positions @ strain, cell @ strain, pbc, calculators
+    )
     energy = module.compute_energy(system)
     if pbc:
         grad_pos, grad_strain = torch.autograd.grad(energy, [positions, strain])

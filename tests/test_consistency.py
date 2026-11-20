@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from conftest import energy_only, evaluate, random_rotation
+from vesin.metatomic import NeighborList
 
 from metatomic_qtip4pf import QTIP4PF
 
@@ -118,3 +119,37 @@ def test_newton_third_law(model, small_box):
     types, positions, cell = small_box
     _, forces, _ = evaluate(model, types, positions, cell)
     assert np.allclose(forces.sum(axis=0), 0.0, atol=1e-9)
+
+
+@pytest.mark.parametrize("skin", [-1.0, 0.5, 2.0])
+def test_verlet_lists(water_216, skin):
+    """
+    Calculators that keep a Verlet list from one call to the next (as the ones of
+    i-PI, with a 2 A skin) give the same results as new ones, for molecules that
+    move by more than the skin over the sequence and for a cell that changes
+    """
+    types, positions, cell = water_216
+    model = QTIP4PF()
+    calculators = [
+        NeighborList(options, "angstrom", skin=skin)
+        for options in model.requested_neighbor_lists()
+    ]
+    without_skin = [
+        NeighborList(options, "angstrom", skin=0.0)
+        for options in model.requested_neighbor_lists()
+    ]
+
+    rng = np.random.default_rng(0)
+    for step in range(10):
+        strain = np.eye(3) + 0.002 * step * rng.normal(size=(3, 3))
+        args = (model, types, positions @ strain, cell @ strain)
+        energy, forces, virial = evaluate(*args, calculators=calculators)
+        ref_energy, ref_forces, ref_virial = evaluate(*args, calculators=without_skin)
+
+        assert energy == pytest.approx(ref_energy, rel=1e-12)
+        assert np.allclose(forces, ref_forces, atol=1e-10)
+        assert np.allclose(virial, ref_virial, atol=1e-8)
+
+        # rigid displacement of each molecule, so that the energy stays low
+        shifts = rng.normal(scale=0.3, size=(len(types) // 3, 1, 3))
+        positions = (positions.reshape(-1, 3, 3) + shifts).reshape(-1, 3)
