@@ -21,7 +21,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "vesin >=0.4"]
+test = ["pytest", "vesin >=0.6"]
+ipi = ["ipi >=4.0.0a1", "ase"]
 
 [project.scripts]
 metatomic-qtip4pf = "metatomic_qtip4pf._cli:main"

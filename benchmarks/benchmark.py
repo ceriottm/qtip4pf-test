@@ -1,8 +1,14 @@
 """
 Timing of energy, forces and virial for small boxes of q-TIP4P/F water, following
-what i-PI's metatomic driver does at each step: neighbor lists from vesin, evaluation
-of the exported model, and forces and virial from automatic differentiation with
-respect to positions and strain.
+what the metatomic driver of i-PI 4.0.0a1 does at each step: neighbor lists from
+vesin, evaluation of the exported model, and forces and virial from automatic
+differentiation with respect to positions and strain.
+
+As in i-PI, each system of a batch has its own neighbor list calculators, which keep
+a Verlet list with a skin of `--skin` Angstrom between calls. Atoms drift by 0.02 A
+per call, so that most calls reuse the list as in a simulation, and the median
+neighbor list time is that of such calls. `--skin 0` gives the time to build a new
+list at each call.
 
     python benchmarks/benchmark.py --device cpu --threads 1
     python benchmarks/benchmark.py --device cuda --sizes 64 --batch 1 8 --profile
@@ -24,7 +30,7 @@ from metatomic.torch import (
     System,
     load_atomistic_model,
 )
-from vesin.metatomic import NeighborList
+from vesin.metatomic import NeighborList, neighbor_lists_for_model
 
 
 # number of Angstrom^3 per molecule at 0.997 g/cm^3
@@ -67,16 +73,26 @@ def water_box(n_molecules, seed=0):
 RNG = np.random.default_rng(0)
 
 
-def make_systems(types, positions, cell, batch, device):
+def trajectories(positions, batch):
     """
-    Systems with positions and cell depending on a strain, as in i-PI. Positions are
-    randomly displaced, so that the number of neighbor pairs changes between calls as
-    in a simulation.
+    Starting positions for each system of a batch (randomly displaced from
+    ``positions``) and their displacements between calls, 0.02 A for each atom
     """
-    all_positions, strains, systems = [], [], []
+    start = [
+        positions + RNG.normal(scale=0.02, size=positions.shape) for _ in range(batch)
+    ]
+    drifts = []
     for _ in range(batch):
-        displaced = positions + RNG.normal(scale=0.02, size=positions.shape)
-        pos = torch.tensor(displaced, device=device, requires_grad=True)
+        drift = RNG.normal(size=positions.shape)
+        drifts.append(0.02 * drift / np.linalg.norm(drift, axis=1, keepdims=True))
+    return start, drifts
+
+
+def make_systems(types, batch_positions, cell, device):
+    """Systems with positions and cell depending on a strain, as in i-PI"""
+    all_positions, strains, systems = [], [], []
+    for positions in batch_positions:
+        pos = torch.tensor(positions, device=device, requires_grad=True)
         strain = torch.eye(3, dtype=torch.float64, device=device, requires_grad=True)
         systems.append(
             System(
@@ -98,6 +114,7 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--skin", type=float, default=2.0, help="Verlet skin (A)")
     parser.add_argument("--model", default=None, help="exported model to use")
     parser.add_argument("--profile", action="store_true", help="count ops & syncs")
     parser.add_argument("--json", default=None, help="save the results here")
@@ -120,22 +137,20 @@ def main():
         length_unit="angstrom",
         outputs={"energy": ModelOutput(unit="eV", sample_kind="system")},
     )
-    calculators = [
-        NeighborList(nl, "angstrom") for nl in model.requested_neighbor_lists()
-    ]
 
     def synchronize():
         if device.type == "cuda":
             torch.cuda.synchronize()
 
-    def step(types, positions, cell, batch):
+    def step(types, batch_positions, cell, calculators):
         all_positions, strains, systems = make_systems(
-            types, positions, cell, batch, device
+            types, batch_positions, cell, device
         )
         synchronize()
         t0 = time.perf_counter()
-        for calculator in calculators:
-            calculator.add_neighbor_list(systems)
+        for system, system_calculators in zip(systems, calculators):
+            for calculator in system_calculators:
+                calculator.add_neighbor_list(system)
         synchronize()
         t1 = time.perf_counter()
         outputs = model(systems, options, check_consistency=False)
@@ -161,11 +176,16 @@ def main():
     for n_molecules in args.sizes:
         types, positions, cell = water_box(n_molecules)
         for batch in args.batch:
-            for _ in range(5):
-                step(types, positions, cell, batch)
-            timings = np.array(
-                [step(types, positions, cell, batch) for _ in range(args.repeats)]
-            )
+            batch_positions, drifts = trajectories(positions, batch)
+            calculators = [
+                neighbor_lists_for_model("angstrom", model, skin=args.skin)
+                for _ in range(batch)
+            ]
+            timings = []
+            for _ in range(5 + args.repeats):
+                timings.append(step(types, batch_positions, cell, calculators))
+                batch_positions = [p + d for p, d in zip(batch_positions, drifts)]
+            timings = np.array(timings[5:])
             nl, fwd, bwd = (1e3 * statistics.median(t) for t in timings.T)
             print(
                 f"{n_molecules:7d} {batch:6d} {nl:8.2f} {fwd:8.2f} {bwd:8.2f} "
@@ -206,7 +226,7 @@ def profile(model, options, types, positions, cell, batch, device):
     from torch.profiler import profile as torch_profile
 
     all_positions, strains, systems = make_systems(
-        types, positions, cell, batch, device
+        types, trajectories(positions, batch)[0], cell, device
     )
     for nl in model.requested_neighbor_lists():
         NeighborList(nl, "angstrom").add_neighbor_list(systems)

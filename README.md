@@ -36,6 +36,25 @@ periodic (any cell shape) or non-periodic.
 `.pt` files are tied to the version of `torch` used to export them, so you should
 export the model in the environment that will run the simulation.
 
+### Running with i-PI
+
+In i-PI (4.0.0a1 or later) the exported model runs inside the i-PI process, through
+a `ffdirect` forcefield. With `batch_size` equal to the number of beads, all the
+beads are evaluated in a single call:
+
+```xml
+<ffdirect name='qtip4pf'>
+  <pes>metatomic</pes>
+  <parameters>{template:init.xyz,model:qtip4pf.pt,device:cpu}</parameters>
+  <batch_size>32</batch_size>
+</ffdirect>
+```
+
+`template` is a structure file that ASE can read, with the atoms in the order given
+above. With `i-pi --backend torch --device cuda input.xml` and `device:cuda`,
+positions and forces stay on the GPU between i-PI and the model. The tests run
+short simulations with the numpy and torch backends of i-PI, on CPU.
+
 ## Model
 
 Internally, the model works in kcal/mol and Å and uses the parameters from Table I
@@ -76,10 +95,20 @@ the neighbor list (computed by the simulation engine), for boxes of water at
 
 | molecules | CPU (1 core), 1 | CPU (1 core), 32 | H100, 1 | H100, 32 | L40S, 1 | L40S, 32 |
 |---|---|---|---|---|---|---|
-| 32 | 3.9 | 2.6 | 4.0 | 0.56 | 3.8 | 0.53 |
-| 64 | 5.9 | 4.9 | 4.0 | 0.56 | 3.8 | 0.62 |
-| 128 | 11.5 | 10.8 | 4.2 | 0.58 | 4.1 | 0.83 |
-| 216 | 21.6 | 20.6 | 4.3 | 0.60 | 4.3 | 1.22 |
+| 32 | 3.2 | 2.3 | 4.0 | 0.56 | 3.8 | 0.53 |
+| 64 | 5.5 | 4.5 | 4.0 | 0.56 | 3.8 | 0.62 |
+| 128 | 10.4 | 10.0 | 4.2 | 0.58 | 4.1 | 0.83 |
+| 216 | 18.8 | 18.9 | 4.3 | 0.60 | 4.3 | 1.22 |
+
+The CPU timings are for one core of an Intel Core Ultra 7 155H, with torch 2.14.1
+and the development version of vesin (commit 8074d9a). The GPU timings are those
+of the previous version of this benchmark (a new neighbor list at each call), and
+have not been measured again with these versions.
+
+On CPU, the neighbor lists of vesin take another 0.8, 1.5, 3.0 and 4.3 ms per system
+for the four box sizes, and a full step of i-PI 4.0.0a1 for the 216-molecule box
+takes 27 ms (23 ms per bead with 32 beads), with either the numpy or the torch
+backend.
 
 On GPU, the time for a single small system (~4 ms) does not depend on its size: it
 is spent launching several hundred small operations, so the GPU only pays off for
@@ -92,7 +121,8 @@ Preloading jemalloc (`LD_PRELOAD=/path/to/libjemalloc.so.2`) or setting
 makes CPU evaluations about 30% faster.
 
 These numbers come from [`benchmarks/benchmark.py`](benchmarks/benchmark.py), which
-follows what i-PI does at each step:
+follows what the metatomic driver of i-PI 4.0.0a1 does at each step, including a
+Verlet neighbor list (with a 2 Å skin) for each system:
 
 ```bash
 python benchmarks/benchmark.py --device cpu --threads 1 --batch 1 32
@@ -107,7 +137,9 @@ The test suite checks:
 - the Ewald sum against the Madelung constants of NaCl and CsCl (including a triclinic cell). It also checks that the result does not depend on the splitting parameter, and the analytical finite-size correction of a dimer in a large box;
 - forces and virial against finite differences, invariance under translations, rotations, molecule wrapping and changes of the cell representation, and size-extensivity in a supercell;
 - energy, forces and virial for a 216-molecule box against the Fortran q-TIP4P/F implementation shipped with i-PI (see [`tests/data/README.md`](tests/data/README.md)). The agreement is ~10⁻⁹ (relative) when both Ewald sums are converged;
-- that the exported TorchScript model reproduces the Python one, with automatic unit conversion.
+- that the exported TorchScript model reproduces the Python one, with automatic unit conversion;
+- that neighbor lists kept between calls (Verlet lists) give the same results as new ones;
+- the exported model through the metatomic driver of i-PI, with numpy arrays and torch tensors, and short path integral simulations with the numpy and torch backends of i-PI. These tests need `pip install ".[ipi]"`, and are skipped otherwise.
 
 Run the tests from a clone of the repository with:
 
